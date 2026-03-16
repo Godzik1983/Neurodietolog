@@ -1,0 +1,9 @@
+aiogram==3.15.0
+python-dotenv==1.0.1
+openai==1.57.4
+faster-whisper==1.1.1
+pyttsx3==2.98
+piper-tts==1.4.1
+pathvalidate==3.3.1
+num2words==0.5.14
+# ffmpeg is a system dependency (installed in Dockerfile via apt)

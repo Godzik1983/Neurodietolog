@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.env
+.git
+.gitignore
+bot_memory.db
+subscribed_users.json
+voices/
+db_index.faiss
+db_index.pkl
