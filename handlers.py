@@ -1,6 +1,7 @@
 ﻿import asyncio
 import json
 import logging
+import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,7 +31,7 @@ subscribed_users: set[int] = set()
 last_reminder_slot: dict[int, str] = {}
 reminder_task: asyncio.Task | None = None
 
-USERS_FILE = Path("subscribed_users.json")
+USERS_FILE = Path(os.getenv("SUBSCRIBERS_FILE", "subscribed_users.json"))
 try:
     REMINDER_TZ = ZoneInfo("Europe/Moscow")
 except ZoneInfoNotFoundError:
@@ -56,6 +57,7 @@ def load_subscribed_users() -> set[int]:
 
 def save_subscribed_users() -> None:
     try:
+        USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
         USERS_FILE.write_text(
             json.dumps(sorted(subscribed_users), ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -300,3 +302,4 @@ async def handle_dialog(message: Message) -> None:
 
 
 subscribed_users = load_subscribed_users()
+

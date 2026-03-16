@@ -6,4 +6,5 @@ pyttsx3==2.98
 piper-tts==1.4.1
 pathvalidate==3.3.1
 num2words==0.5.14
+requests==2.32.3
 # ffmpeg is a system dependency (installed in Dockerfile via apt)

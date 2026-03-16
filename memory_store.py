@@ -1,11 +1,13 @@
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path("bot_memory.db")
+DB_PATH = Path(os.getenv("BOT_DB_PATH", "bot_memory.db"))
 
 
 def _connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(DB_PATH)
 
 

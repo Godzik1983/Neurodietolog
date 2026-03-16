@@ -6,15 +6,23 @@ import tempfile
 import threading
 import wave
 from pathlib import Path
+from typing import Any
 
 import piper
-import pyttsx3
-import pythoncom
 from faster_whisper import WhisperModel
 from num2words import num2words
 from piper.config import SynthesisConfig
 from piper.download_voices import download_voice
 from piper.voice import PiperVoice
+
+try:
+    import pyttsx3  # type: ignore
+    import pythoncom  # type: ignore
+    HAS_PYTTSX3 = True
+except Exception:
+    pyttsx3 = None  # type: ignore
+    pythoncom = None  # type: ignore
+    HAS_PYTTSX3 = False
 
 _MODEL: WhisperModel | None = None
 _MODEL_LOCK = threading.Lock()
@@ -26,6 +34,7 @@ PIPER_VOICE_NAME = os.getenv("PIPER_VOICE", "ru_RU-ruslan-medium")
 PIPER_DIR = Path(os.getenv("PIPER_DIR", "voices"))
 PIPER_ESPEAK_DIR = Path(piper.__file__).parent / "espeak-ng-data"
 STT_MODEL_NAME = os.getenv("STT_MODEL", "tiny")
+STT_CACHE_DIR = Path(os.getenv("STT_CACHE_DIR", "/tmp/.cache/faster-whisper"))
 PIPER_LENGTH_SCALE = float(os.getenv("PIPER_LENGTH_SCALE", "1.22"))
 PIPER_SENTENCE_SILENCE_MS = int(os.getenv("PIPER_SENTENCE_SILENCE_MS", "220"))
 
@@ -51,7 +60,16 @@ def _get_stt_model() -> WhisperModel:
     if _MODEL is None:
         with _MODEL_LOCK:
             if _MODEL is None:
-                _MODEL = WhisperModel(STT_MODEL_NAME, device="cpu", compute_type="int8")
+                STT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                os.environ.setdefault("HF_HOME", str(STT_CACHE_DIR))
+                os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(STT_CACHE_DIR))
+                os.environ.setdefault("XDG_CACHE_HOME", str(STT_CACHE_DIR.parent))
+                _MODEL = WhisperModel(
+                    STT_MODEL_NAME,
+                    device="cpu",
+                    compute_type="int8",
+                    download_root=str(STT_CACHE_DIR),
+                )
     return _MODEL
 
 
@@ -62,7 +80,7 @@ def transcribe_audio_file(audio_path: str) -> str:
     return text
 
 
-def _set_russian_voice(engine: pyttsx3.Engine) -> None:
+def _set_russian_voice(engine: Any) -> None:
     voices = engine.getProperty("voices") or []
     for voice in voices:
         voice_id = (getattr(voice, "id", "") or "").lower()
@@ -147,6 +165,9 @@ def _synthesize_wav_piper(text: str) -> str:
 
 
 def _synthesize_wav_pyttsx3(text: str) -> str:
+    if not HAS_PYTTSX3:
+        raise RuntimeError("pyttsx3/pythoncom is not available on this platform")
+
     fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="tts_")
     os.close(fd)
     with _TTS_LOCK:

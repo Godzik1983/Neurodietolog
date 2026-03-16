@@ -1,54 +1,73 @@
-# Bot_diet
+﻿# Neurodietolog Bot
 
-Telegram-бот по поддержке похудения с:
+Telegram-бот по похудению с:
 - текстовыми ответами,
-- голосовым STT (локально),
-- голосовым TTS (локально),
-- напоминаниями каждые 2 часа (с 01:00 до 08:00 не пишет),
-- сохранением истории в SQLite и авто-суммаризацией.
+- STT (распознавание речи),
+- TTS (голосовые ответы),
+- напоминаниями раз в 2 часа (тихий режим с 01:00 до 08:00),
+- хранением памяти в SQLite и авто-суммаризацией.
 
-## Настройка `.env`
+## Переменные окружения
 
-Минимально нужны:
+### Обязательные
 
 ```env
-TELEGRAM_TOKEN=your_telegram_bot_token
-OPENAI_API_KEY=your_api_key
+TELEGRAM_TOKEN=...
+OPENAI_API_KEY=...
 OPENAI_BASE_URL=https://api.vsellm.ru/v1
+WEBHOOK_BASE_URL=https://neurodietolog.containerapps.ru
 ```
+
+### Рекомендуемые для webhook
+
+```env
+WEBHOOK_PATH=/webhook
+WEBHOOK_SECRET=long_random_secret
+WEBAPP_HOST=0.0.0.0
+WEBAPP_PORT=8080
+```
+
+### STT/TTS и локальные файлы (для Container App)
+
+```env
+STT_MODEL=tiny
+STT_CACHE_DIR=/tmp/.cache/faster-whisper
+PIPER_DIR=/tmp/voices
+PIPER_LENGTH_SCALE=1.22
+PIPER_SENTENCE_SILENCE_MS=220
+BOT_DB_PATH=/tmp/bot_memory.db
+SUBSCRIBERS_FILE=/tmp/subscribed_users.json
+LOG_FILE=
+```
+
+Примечание:
+- `LOG_FILE` лучше оставить пустым в контейнере, чтобы логи шли в stdout/stderr.
+- `ffmpeg` ставится в образе через `Dockerfile`.
 
 ## Локальный запуск (PowerShell)
 
 ```powershell
 cd C:\Users\Игорь\projects\Bot_diet
-
-# 1) Установить/обновить зависимости
 venv\Scripts\python -m pip install -r requirements.txt
-
-# 2) Запустить бота
 venv\Scripts\python bot.py
 ```
 
-## Запуск в фоне (PowerShell)
+## Сборка и push образа (cloud.ru)
 
-```powershell
-cd C:\Users\Игорь\projects\Bot_diet
-Start-Process -FilePath "venv\Scripts\python.exe" -ArgumentList "bot.py" -WorkingDirectory "."
+```bash
+docker login neurodietolog.cr.cloud.ru -u <USER> -p <PASSWORD>
+docker build . --platform linux/amd64 -t neurodietolog.cr.cloud.ru/neurodietolog:latest
+docker push neurodietolog.cr.cloud.ru/neurodietolog:latest
 ```
 
-## Проверить, что бот запущен
+## Установка webhook в Telegram API
 
-```powershell
-Get-CimInstance Win32_Process |
-  Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*bot.py*" } |
-  Select-Object ProcessId, CommandLine
+```text
+https://api.telegram.org/bot<TELEGRAM_TOKEN>/setWebhook?url=https://neurodietolog.containerapps.ru/webhook&drop_pending_updates=true
 ```
 
-## Остановить все экземпляры бота
+Проверка webhook:
 
-```powershell
-Get-CimInstance Win32_Process |
-  Where-Object { $_.Name -eq "python.exe" -and $_.CommandLine -like "*bot.py*" } |
-  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```text
+https://api.telegram.org/bot<TELEGRAM_TOKEN>/getWebhookInfo
 ```
-
