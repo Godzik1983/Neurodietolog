@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import openai
 import requests
 from dotenv import load_dotenv
 from typing import Any
@@ -53,12 +54,12 @@ MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "30"))
 MAX_IMAGE_PROCESSED = int(os.getenv("MAX_IMAGE_PROCESSED", "5"))
 MAX_TEXT_MESSAGES = int(os.getenv("MAX_TEXT_MESSAGES", "20"))
 REPLY_DELAY_SECONDS = int(os.getenv("REPLY_DELAY_SECONDS", "10"))
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
 FINISHED_DIALOG_TEXT = "Спасибо за общение! Мы завершили диалог. Хорошего дня :-)"
-MANAGER_ESCALATION_TEXT = "передадим вопрос менеджеру для решения он вам позвонит в ближайшее веремя"
 
 SYSTEM_PROMPT = f"""
 Ты — менеджер по работе с отзывами и обратной связью.
@@ -69,7 +70,6 @@ SYSTEM_PROMPT = f"""
 - Если клиент доволен, предложи отзыв по ссылке {REVIEW_LINK}.
 - Если клиент недоволен, сначала уточни причину и прояви эмпатию.
 - Если клиент просит не писать, попрощайся и останови диалог.
-- Если клиент прислал скриншот отзыва, подтверди и выдай промокод {PROMO_CODE}.
 """.strip()
 
 
@@ -139,7 +139,7 @@ def init_db() -> None:
     conn.close()
 
 
-def upsert_chat(chat_id: int, chat_type=None, sender=None, bot=None, finish=0, tone_of_voice=None, result=None) -> None:
+def upsert_chat(chat_id: int, chat_type=None, sender=None, bot=None, finish=None, tone_of_voice=None, result=None) -> None:
     now = datetime.now().isoformat(timespec="seconds")
     conn = get_db()
     cur = conn.cursor()
@@ -413,8 +413,18 @@ def analyze_review_screenshot(file_path: str, model="gpt-4.1-mini") -> dict:
         return {"is_review_screenshot": False, "review_is_positive": False, "reason": "parse_error"}
 
 
-def generate_dialog_reply(query: str, history: str, short_history: str, tone_of_voice: str, dialog_state: str,  system_prompt: str, model="gpt-4.1-mini", get_photo=False) -> str:
+def generate_dialog_reply(query: str, history: str, short_history: str, tone_of_voice: str, dialog_state: str, system_prompt: str, model="gpt-4.1-mini", get_photo=False) -> str:
+    retrieval_query = f"""
+    Последнее сообщение клиента:
+    {query}
+
+    Краткий контекст диалога:
+    {short_history}
+    """.strip()
+
     
+    state_instruction = ""
+    #needs_review_link = False
 
     if dialog_state == "positive_review_request":
        # needs_review_link = True
@@ -428,11 +438,17 @@ def generate_dialog_reply(query: str, history: str, short_history: str, tone_of_
 
     elif dialog_state == "negative_followup":
         state_instruction = (
-            f"""Клиент недоволен.
-1. Сначала коротко прояви эмпатию и уточни, что именно не устроило.
-2. Затем предложи: если клиент оставит хороший отзыв, мы дадим подарок (промокод {PROMO_CODE}).
-3. Если клиент согласен на отзыв за подарок: поблагодари и отправь ссылку {REVIEW_LINK}, попроси прислать скриншот.
-4. Если клиент не согласен: вежливо попрощайся и заверши диалог без давления."""
+            """Шаг1: Клиент не доволен. Сначала коротко прояви эмпатию и уточни, что именно не устроило.
+            Шаг2: Спроси может ли Клиент дать нам второй шанс и остаться в числе наших клиентов
+                1. Если "Нет" то вежливо завершаем диалог
+                2. Если "Нет однозначного ответа" то скажи что мы обязательно всё исправим и если сейчас не смотря ниначто он оставит нам ХОРОШИй отзыв то мы дадим Клиенту подарок
+                3. Если "Да" то Аккуратно попроси ХОРОШИЙ отзыв, пообещай что исправимся и улучшим всё по его замечаниям что за отзыв подарим бесплатный подарок ."""
+                        f"""Далее переходим в блок в зависимости от того что ответил клиент согласен оставить ХОРОШИЙ отзыв или несогласен:
+                              1. Если "Несогласен" то вежливо завершаем диалог пообещай что исправимся и улучшим всё по его замечаниям
+                              2. Если "Согласен", Поблагодари кратко и скинь ссылку {REVIEW_LINK}
+                                  Далее переходим в блок в зависимости от того оставил ли нам клиент отзыв или нет:
+                                    1. Если "Оставил", то потправляем ему промокод {PROMO_CODE}
+                                      2. Если "Нет" то вежливо завершаем диалог """
         )
 
 
@@ -453,28 +469,29 @@ def generate_dialog_reply(query: str, history: str, short_history: str, tone_of_
     else:
         state_instruction = ("Задавай вопросы чтобы получить более точную информацию что непонавилось")
 
-    user_prompt = f"""
-    История диалога:
-    {history}
+    completion = openai.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": f"{system_prompt}\n\n тональность: {tone_of_voice}\n\n ВАЖНО сценарий: {state_instruction}"},
+            {"role": "user", "content": f"""
 
-    Тон клиента: {tone_of_voice}
-    Состояние диалога: {dialog_state}
-    Инструкция сценария: {state_instruction}    
+    История:
+    {history}
 
     Последнее сообщение клиента:
     {query}
-    """.strip()
-
-    c = get_openai_client().chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+    """}
         ],
-        temperature=0.4,
+        temperature=0
     )
-    return (c.choices[0].message.content or "").strip()
+    
 
+
+    
+    answer = (completion.choices[0].message.content or "").strip()
+    #if needs_review_link:
+      # answer = f"{answer} {REVIEW_LINK}".strip()
+    return answer
 
 def api_get(path, params=None, timeout=120):
     r = requests.get(f"{BASE_URL}{path}", headers=HEADERS, params=params, timeout=timeout)
@@ -488,8 +505,8 @@ def api_post(path, params=None, payload=None, timeout=120):
     return r.json()
 
 
-def send_text(chat_id: int, text: str):
-    if REPLY_DELAY_SECONDS > 0:
+def send_text(chat_id: int, text: str, with_delay: bool = True):
+    if with_delay and REPLY_DELAY_SECONDS > 0:
         time.sleep(REPLY_DELAY_SECONDS)
     return api_post("/messages", params={"chat_id": chat_id}, payload={"text": text, "notify": True})
 
@@ -504,7 +521,7 @@ def is_start_message(meta: dict) -> bool:
 
 
 def send_initial_message(chat_id: int, bot: int, sender: int) -> None:
-    result = send_text(chat_id, INITIAL_MESSAGE)
+    result = send_text(chat_id, INITIAL_MESSAGE, with_delay=False)
     body = result.get("body", {}) if isinstance(result, dict) else {}
     save_message_to_db("outgoing", chat_id, bot, sender, body.get("mid"), body.get("seq"), INITIAL_MESSAGE, raw_json=result)
     update_chat_fields(chat_id=chat_id, finish=0, result=RESULT_IN_PROGRESS)
@@ -577,7 +594,7 @@ def main() -> None:
                     continue
 
                 chat_id = meta["chat_id"]
-                upsert_chat(chat_id, meta["chat_type"], meta["sender"], meta["bot"], finish=0, tone_of_voice=None, result=RESULT_IN_PROGRESS)
+                upsert_chat(chat_id, meta["chat_type"], meta["sender"], meta["bot"], finish=None, tone_of_voice=None, result=RESULT_IN_PROGRESS)
 
                 chat_info = get_chat(chat_id)
                 if chat_info and chat_info.get("finish") == 1:
@@ -586,8 +603,11 @@ def main() -> None:
                     continue
 
                 if count_messages_from_db(chat_id, direction="incoming") >= MAX_MESSAGES:
-                    send_text(chat_id, FINISHED_DIALOG_TEXT)
-                    update_chat_fields(chat_id=chat_id, finish=1, result="max_messages_reached")
+                    if TEST_MODE:
+                        send_text(chat_id, "TEST_MODE: лимит сообщений достигнут, продолжаем без завершения диалога.")
+                    else:
+                        send_text(chat_id, FINISHED_DIALOG_TEXT)
+                        update_chat_fields(chat_id=chat_id, finish=1, result="max_messages_reached")
                     continue
 
                 attachment_type = None
@@ -622,31 +642,54 @@ def main() -> None:
                 if meta["text"]:
                     text_count = count_text_messages_from_db(chat_id, direction="incoming")
                     if text_count > MAX_TEXT_MESSAGES:
-                        send_text(chat_id, MANAGER_ESCALATION_TEXT)
-                        update_chat_fields(chat_id=chat_id, finish=1, result="manager_escalation_text_limit")
+                        send_text(chat_id, FINISHED_DIALOG_TEXT)
+                        if not TEST_MODE:
+                            update_chat_fields(chat_id=chat_id, finish=1, result="max_text_messages_reached")
                         continue
 
                 if attachment_type == "image" and file_path:
                     if count_attachments_from_db(chat_id, attachment_type="image") >= MAX_IMAGE_PROCESSED:
-                        send_text(chat_id, MANAGER_ESCALATION_TEXT)
-                        update_chat_fields(chat_id=chat_id, finish=1, result="manager_escalation_image_limit")
+                        send_text(chat_id, FINISHED_DIALOG_TEXT)
+                        if not TEST_MODE:
+                            update_chat_fields(chat_id=chat_id, finish=1, result="max_images_reached")
                         continue
-                    verification = analyze_review_screenshot(file_path=file_path, model=os.getenv("SCREENSHOT_MODEL", "gpt-4.1-mini"))
+
+                    verification = analyze_review_screenshot(
+                        file_path=file_path,
+                        model=os.getenv("SCREENSHOT_MODEL", "gpt-4.1-mini"),
+                    )
                     get_photo = verification.get("is_review_screenshot") is True
 
                     if get_photo:
-                        bot_text = f"Спасибо! Вижу опубликованный отзыв. Ваш промокод: {PROMO_CODE}"
+                        bot_text = f"Спасибо! Вижу опубликованный отзыв. Ваш промокод на подарок: {PROMO_CODE}"
                         result = send_text(chat_id, bot_text)
                         body = result.get("body", {}) if isinstance(result, dict) else {}
-                        save_message_to_db("outgoing", chat_id, meta["bot"], meta["sender"], body.get("mid"), body.get("seq"), bot_text, raw_json=result)
+                        save_message_to_db(
+                            "outgoing",
+                            chat_id,
+                            meta["bot"],
+                            meta["sender"],
+                            body.get("mid"),
+                            body.get("seq"),
+                            bot_text,
+                            raw_json=result,
+                        )
                         update_chat_fields(chat_id=chat_id, finish=1, result=RESULT_REVIEW_CONFIRMED)
                     else:
-                        bot_text = "Похоже, на фото не видно опубликованного отзыва. Пришлите, пожалуйста, скриншот еще раз."
+                        bot_text = "Похоже, на фото не видно опубликованного отзыва. Пришлите, пожалуйста, скриншот страницы с отзывом ещё раз."
                         result = send_text(chat_id, bot_text)
                         body = result.get("body", {}) if isinstance(result, dict) else {}
-                        save_message_to_db("outgoing", chat_id, meta["bot"], meta["sender"], body.get("mid"), body.get("seq"), bot_text, raw_json=result)
+                        save_message_to_db(
+                            "outgoing",
+                            chat_id,
+                            meta["bot"],
+                            meta["sender"],
+                            body.get("mid"),
+                            body.get("seq"),
+                            bot_text,
+                            raw_json=result,
+                        )
                     continue
-
                 if is_start_message(meta):
                     send_initial_message(chat_id, meta["bot"], meta["sender"])
                     continue
@@ -660,27 +703,6 @@ def main() -> None:
                     tone_of_voice = detect_tone_of_voice(meta["text"], history, model=os.getenv("CLASSIFIER_MODEL", "gpt-4.1-mini"))
                     dialog_state = detect_dialog_state(meta["text"], history, get_photo=get_photo, model=os.getenv("CLASSIFIER_MODEL", "gpt-4.1-mini"))
 
-                    if dialog_state == "negative_followup":
-                        result = send_text(chat_id, MANAGER_ESCALATION_TEXT)
-                        body = result.get("body", {}) if isinstance(result, dict) else {}
-                        save_message_to_db(
-                            "outgoing",
-                            chat_id,
-                            meta["bot"],
-                            meta["sender"],
-                            body.get("mid"),
-                            body.get("seq"),
-                            MANAGER_ESCALATION_TEXT,
-                            raw_json=result,
-                        )
-                        update_chat_fields(
-                            chat_id,
-                            finish=1,
-                            result="manager_escalation_negative_followup",
-                            tone_of_voice=tone_of_voice,
-                        )
-                        continue
-
                     bot_text = generate_dialog_reply(
                         meta["text"],
                         history,
@@ -691,6 +713,8 @@ def main() -> None:
                         model=os.getenv("CHAT_MODEL", "gpt-4.1-mini"),
                         get_photo=get_photo,
                     )
+                    if (not get_photo) and (str(PROMO_CODE) in bot_text):
+                        bot_text = "????? ???????? ????????? ?????? ???????? ?????."
                     result = send_text(chat_id, bot_text)
                     body = result.get("body", {}) if isinstance(result, dict) else {}
                     save_message_to_db("outgoing", chat_id, meta["bot"], meta["sender"], body.get("mid"), body.get("seq"), bot_text, raw_json=result)
