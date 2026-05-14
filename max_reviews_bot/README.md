@@ -19,7 +19,6 @@ cp max_reviews_bot/.env.example max_reviews_bot/.env
 2. Заполните минимум:
 - `OPENAI_API_KEY`
 - `MAX_BOT_TOKEN`
-- Для безопасного теста с телефона можно включить `TEST_MODE=true` в `max_reviews_bot/.env`
 
 3. Проверьте FAISS индекс в `max_reviews_bot/faiss_index/`:
 - `index.faiss`
