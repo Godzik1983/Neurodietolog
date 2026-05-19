@@ -52,7 +52,7 @@ RESULT_IN_PROGRESS = "диалог в процессе"
 MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "30"))
 MAX_IMAGE_PROCESSED = int(os.getenv("MAX_IMAGE_PROCESSED", "5"))
 MAX_TEXT_MESSAGES = int(os.getenv("MAX_TEXT_MESSAGES", "20"))
-REPLY_DELAY_SECONDS = int(os.getenv("REPLY_DELAY_SECONDS", "5"))
+REPLY_DELAY_SECONDS = int(os.getenv("REPLY_DELAY_SECONDS", "3"))
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
@@ -734,7 +734,7 @@ def main() -> None:
                     continue
 
                 chat_id = meta["chat_id"]
-                upsert_chat(chat_id, meta["chat_type"], meta["sender"], meta["bot"], finish=0, tone_of_voice=None, result=None)
+                upsert_chat(chat_id, meta["chat_type"], meta["sender"], meta["bot"], finish=None, tone_of_voice=None, result=None)
 
                 chat_info = get_chat(chat_id)
                 if chat_info and chat_info.get("finish") == 1:
