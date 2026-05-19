@@ -41,7 +41,7 @@ BASE_URL = os.getenv("MAX_BASE_URL", "https://platform-api.max.ru")
 HEADERS = {"Authorization": BOT_TOKEN or "", "Content-Type": "application/json"}
 
 INITIAL_MESSAGE = (
-    "Здравствуйте, вы делали у нас заказ, не могли бы поставить оценку от 1 до 5, "
+    "Здравствуйте, вы делали заказ в СУШИСЕТ Реутов, поставьте оценку от 1 до 5, "
     "где 5 — это отлично, а 1 — это совсем плохо. Или напишите текстом всё ли вам понравилось."
 )
 REVIEW_LINK = os.getenv("REVIEW_LINK", "https://yandex.com/maps/org/sushi_set/28401092521/reviews/")
@@ -52,13 +52,17 @@ RESULT_IN_PROGRESS = "диалог в процессе"
 MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", "30"))
 MAX_IMAGE_PROCESSED = int(os.getenv("MAX_IMAGE_PROCESSED", "5"))
 MAX_TEXT_MESSAGES = int(os.getenv("MAX_TEXT_MESSAGES", "20"))
-REPLY_DELAY_SECONDS = int(os.getenv("REPLY_DELAY_SECONDS", "10"))
+REPLY_DELAY_SECONDS = int(os.getenv("REPLY_DELAY_SECONDS", "5"))
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
 FINISHED_DIALOG_TEXT = "Спасибо за общение! Мы завершили диалог. Хорошего дня :-)"
-MANAGER_ESCALATION_TEXT = "передадим вопрос менеджеру для решения он вам позвонит в ближайшее веремя"
+MANAGER_ESCALATION_TEXT = "Спасибо за обратную связь! Передадим вопрос менеджеру для решения. Мы ценим ваше замечание и обязательно всё исправим."
+NEGATIVE_REASON_PROMPT = "Сожалеем, что вам не понравилось. Подскажите, пожалуйста, что именно не устроило?"
+RETENTION_PROMPT = "Могли бы дать нам шанс исправиться? Можем надеяться, что вы останетесь нашим клиентом в дальнейшем?"
+TEXT_ONLY_PROMPT = "Пожалуйста, напишите текстом."
+SCREENSHOT_REQUEST_PROMPT = "Отлично, спасибо! Пришлите, пожалуйста, скриншот опубликованного отзыва."
 
 SYSTEM_PROMPT = f"""
 Ты — менеджер по работе с отзывами и обратной связью.
@@ -108,12 +112,20 @@ def init_db() -> None:
             title TEXT,
             finish INTEGER DEFAULT 0,
             tone_of_voice TEXT,
+            dislike_reason TEXT,
+            negative_followup TEXT,
             result TEXT,
             first_seen_at TEXT NOT NULL,
             last_seen_at TEXT NOT NULL
         )
         """
     )
+    cur.execute("PRAGMA table_info(chats)")
+    columns = {row[1] for row in cur.fetchall()}
+    if "dislike_reason" not in columns:
+        cur.execute("ALTER TABLE chats ADD COLUMN dislike_reason TEXT")
+    if "negative_followup" not in columns:
+        cur.execute("ALTER TABLE chats ADD COLUMN negative_followup TEXT")
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
@@ -189,7 +201,7 @@ def save_message_to_db(direction: str, chat_id: int, sender_user_id=None, recipi
     conn.close()
 
 
-def update_chat_fields(chat_id: int, finish=None, tone_of_voice=None, result=None) -> None:
+def update_chat_fields(chat_id: int, finish=None, tone_of_voice=None, result=None, dislike_reason=None, negative_followup=None) -> None:
     updates = []
     params = []
     if finish is not None:
@@ -201,6 +213,12 @@ def update_chat_fields(chat_id: int, finish=None, tone_of_voice=None, result=Non
     if result is not None:
         updates.append("result = ?")
         params.append(result)
+    if dislike_reason is not None:
+        updates.append("dislike_reason = ?")
+        params.append(dislike_reason)
+    if negative_followup is not None:
+        updates.append("negative_followup = ?")
+        params.append(negative_followup)
     updates.append("last_seen_at = ?")
     params.append(datetime.now().isoformat(timespec="seconds"))
     params.append(chat_id)
@@ -215,12 +233,54 @@ def update_chat_fields(chat_id: int, finish=None, tone_of_voice=None, result=Non
 def get_chat(chat_id: int):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT chat_id, finish, result, tone_of_voice FROM chats WHERE chat_id = ?", (chat_id,))
+    cur.execute("SELECT chat_id, finish, result, tone_of_voice, dislike_reason, negative_followup FROM chats WHERE chat_id = ?", (chat_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
         return None
-    return {"chat_id": row[0], "finish": row[1], "result": row[2], "tone_of_voice": row[3]}
+    return {
+        "chat_id": row[0],
+        "finish": row[1],
+        "result": row[2],
+        "tone_of_voice": row[3],
+        "dislike_reason": row[4],
+        "negative_followup": row[5],
+    }
+
+
+def _is_reason_specific_enough(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) >= 12:
+        return True
+    return len(t.split()) >= 2
+
+
+def _is_review_done_intent(text: str) -> bool:
+    t = (text or "").strip().lower()
+    patterns = [
+        "оставил отзыв",
+        "оставила отзыв",
+        "написал отзыв",
+        "написала отзыв",
+        "сделал отзыв",
+        "сделала отзыв",
+        "отзыв оставил",
+        "отзыв оставила",
+        "готово",
+        "done",
+    ]
+    if any(p in t for p in patterns):
+        return True
+    return "сделал" in t and "отзыв" in t
+
+
+def _extract_rating(text: str) -> int | None:
+    t = (text or "").strip().lower().replace(",", ".")
+    if t in {"1", "2", "3", "4", "5"}:
+        return int(t)
+    if t in {"5/5", "5 из 5", "5 из5"}:
+        return 5
+    return None
 
 
 def count_messages_from_db(chat_id: int, direction=None) -> int:
@@ -383,6 +443,60 @@ def detect_tone_of_voice(query: str, history: str, model="gpt-4.1-mini") -> str:
         return "neutral"
 
 
+def summarize_negative_followup(query: str, history: str, short_history: str | None = None, model="gpt-4.1-mini") -> dict:
+    prompt = f"""
+Анализируй последнее сообщение клиента и верни JSON.
+
+История диалога:
+{history}
+
+Краткая история:
+{short_history}
+
+Последнее сообщение клиента:
+{query}
+
+Если в сообщении содержится конкретная причина недовольства, верни:
+{{
+  "needs_clarification": false,
+  "clarifying_question": null,
+  "negative_followup": "краткая причина недовольства на русском"
+}}
+
+Если причина недостаточно конкретна или требуется уточнение, верни:
+{{
+  "needs_clarification": true,
+  "clarifying_question": "краткий уточняющий вопрос на русском",
+  "negative_followup": null
+}}
+
+Ответ должен содержать только JSON.
+"""
+    try:
+        c = get_openai_client().chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Классификатор жалоб клиента. Верни только JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+        )
+        raw = (c.choices[0].message.content or "").strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+        parsed = json.loads(raw)
+        return {
+            "needs_clarification": bool(parsed.get("needs_clarification")),
+            "clarifying_question": str(parsed.get("clarifying_question") or "").strip(),
+            "negative_followup": str(parsed.get("negative_followup") or "").strip(),
+        }
+    except Exception:
+        logging.exception("summarize_negative_followup failed")
+        return {"needs_clarification": True, "clarifying_question": NEGATIVE_REASON_PROMPT, "negative_followup": ""}
+
+
 def analyze_review_screenshot(file_path: str, model="gpt-4.1-mini") -> dict:
     import base64
 
@@ -392,25 +506,68 @@ def analyze_review_screenshot(file_path: str, model="gpt-4.1-mini") -> dict:
         b64 = base64.b64encode(f.read()).decode("utf-8")
     data_url = f"data:{mime_type};base64,{b64}"
 
+    instructions = """
+Верни только JSON:
+{
+  "is_review_screenshot": true,
+  "has_visible_stars": true,
+  "stars": 5,
+  "review_is_positive": true,
+  "confidence": "high",
+  "reason": "short reason"
+}
+
+Правила:
+- Считай изображение скриншотом опубликованного отзыва, если видны типичные признаки карточки отзыва:
+  текст отзыва, имя автора, звезды, дата/время, элементы интерфейса страницы отзывов,
+  кнопки вроде "Редактировать отзыв", вкладка "Отзывы", блок рейтинга.
+- Скрин может быть частичным, сжатым, с телефона, с обрезанным верхом/низом.
+- Если видно только страницу заведения без карточки отзыва и без текста отзыва: is_review_screenshot=false.
+- Если звезды неразличимы, поставь has_visible_stars=false и stars=null.
+- confidence: low/medium/high.
+- Никакого текста вне JSON.
+""".strip()
+
     c = get_openai_client().chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": "Проверь, является ли картинка скриншотом опубликованного отзыва. Верни только JSON."},
+            {"role": "system", "content": "?? ??????????, ???????? ?? ??????????? ?????????? ??????????????? ??????. ????????? ?????? JSON."},
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": '{"is_review_screenshot":true,"review_is_positive":true,"reason":"short"}'},
+                    {"type": "text", "text": instructions},
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             },
         ],
         temperature=0,
     )
+
     raw = (c.choices[0].message.content or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except Exception:
-        return {"is_review_screenshot": False, "review_is_positive": False, "reason": "parse_error"}
+        return {"is_review_screenshot": False, "review_is_positive": False, "reason": "parse_error", "confidence": "low"}
+
+    is_review = bool(parsed.get("is_review_screenshot", False))
+    confidence = str(parsed.get("confidence", "low") or "low").lower()
+
+    # Relaxed acceptance for real-world Yandex screenshots: allow medium confidence.
+    accepted = is_review and confidence in {"medium", "high"}
+
+    return {
+        "is_review_screenshot": accepted,
+        "has_visible_stars": bool(parsed.get("has_visible_stars", False)),
+        "stars": parsed.get("stars"),
+        "review_is_positive": bool(parsed.get("review_is_positive", False)),
+        "confidence": confidence,
+        "reason": str(parsed.get("reason", "") or "").strip(),
+    }
 
 
 def generate_dialog_reply(query: str, history: str, short_history: str, tone_of_voice: str, dialog_state: str,  system_prompt: str, model="gpt-4.1-mini", get_photo=False) -> str:
@@ -429,10 +586,10 @@ def generate_dialog_reply(query: str, history: str, short_history: str, tone_of_
     elif dialog_state == "negative_followup":
         state_instruction = (
             f"""Клиент недоволен.
-1. Сначала коротко прояви эмпатию и уточни, что именно не устроило.
-2. Затем предложи: если клиент оставит хороший отзыв, мы дадим подарок (промокод {PROMO_CODE}).
-3. Если клиент согласен на отзыв за подарок: поблагодари и отправь ссылку {REVIEW_LINK}, попроси прислать скриншот.
-4. Если клиент не согласен: вежливо попрощайся и заверши диалог без давления."""
+            1. Сначала коротко прояви эмпатию и уточни, что именно не устроило.
+            2. Затем ответь: Нам жаль что так получилось. 
+            3. Затем спроси примерно такое : моглибы дать нам шанс исправиться?, можем надеяться что вы останентесь нашим клиентом в дальнейшем?
+            4. Затем попрощайся: Спасибо за обратную связь! Передадим вопрос менеджеру для решения. Мы ценим ваше замечание и обязательно всё исправим."""
         )
 
 
@@ -488,8 +645,8 @@ def api_post(path, params=None, payload=None, timeout=120):
     return r.json()
 
 
-def send_text(chat_id: int, text: str):
-    if REPLY_DELAY_SECONDS > 0:
+def send_text(chat_id: int, text: str, with_delay: bool = True):
+    if with_delay and REPLY_DELAY_SECONDS > 0:
         time.sleep(REPLY_DELAY_SECONDS)
     return api_post("/messages", params={"chat_id": chat_id}, payload={"text": text, "notify": True})
 
@@ -504,7 +661,7 @@ def is_start_message(meta: dict) -> bool:
 
 
 def send_initial_message(chat_id: int, bot: int, sender: int) -> None:
-    result = send_text(chat_id, INITIAL_MESSAGE)
+    result = send_text(chat_id, INITIAL_MESSAGE, with_delay=False)
     body = result.get("body", {}) if isinstance(result, dict) else {}
     save_message_to_db("outgoing", chat_id, bot, sender, body.get("mid"), body.get("seq"), INITIAL_MESSAGE, raw_json=result)
     update_chat_fields(chat_id=chat_id, finish=0, result=RESULT_IN_PROGRESS)
@@ -577,7 +734,7 @@ def main() -> None:
                     continue
 
                 chat_id = meta["chat_id"]
-                upsert_chat(chat_id, meta["chat_type"], meta["sender"], meta["bot"], finish=0, tone_of_voice=None, result=RESULT_IN_PROGRESS)
+                upsert_chat(chat_id, meta["chat_type"], meta["sender"], meta["bot"], finish=0, tone_of_voice=None, result=None)
 
                 chat_info = get_chat(chat_id)
                 if chat_info and chat_info.get("finish") == 1:
@@ -619,7 +776,139 @@ def main() -> None:
                     upd,
                 )
 
+                if not meta["text"] and attachment_type not in {"image", "audio", "voice"}:
+                    send_text(chat_id, TEXT_ONLY_PROMPT)
+                    continue
+
                 if meta["text"]:
+                    history = build_history_for_llm(chat_id, limit=20)
+                    short_history = build_short_history_context(chat_id, limit=8)
+                    tone_of_voice = detect_tone_of_voice(meta["text"], history, model=os.getenv("CLASSIFIER_MODEL", "gpt-4.1-mini"))
+                    review_done_intent = _is_review_done_intent(meta["text"])
+                    rating = _extract_rating(meta["text"])
+
+                    if rating == 5:
+                        bot_text = (
+                            f"Спасибо за высокую оценку! Будем благодарны за отзыв: {REVIEW_LINK} "
+                            "После публикации пришлите, пожалуйста, скриншот."
+                        )
+                        result = send_text(chat_id, bot_text)
+                        body = result.get("body", {}) if isinstance(result, dict) else {}
+                        save_message_to_db(
+                            "outgoing",
+                            chat_id,
+                            meta["bot"],
+                            meta["sender"],
+                            body.get("mid"),
+                            body.get("seq"),
+                            bot_text,
+                            raw_json=result,
+                        )
+                        update_chat_fields(chat_id=chat_id, finish=0, result=RESULT_IN_PROGRESS, tone_of_voice="friendly")
+                        continue
+                    if rating in {1, 2, 3, 4}:
+                        result = send_text(chat_id, NEGATIVE_REASON_PROMPT)
+                        body = result.get("body", {}) if isinstance(result, dict) else {}
+                        save_message_to_db(
+                            "outgoing",
+                            chat_id,
+                            meta["bot"],
+                            meta["sender"],
+                            body.get("mid"),
+                            body.get("seq"),
+                            NEGATIVE_REASON_PROMPT,
+                            raw_json=result,
+                        )
+                        update_chat_fields(chat_id=chat_id, finish=0, result="awaiting_dislike_reason", tone_of_voice="negative")
+                        continue
+
+                    if review_done_intent and not get_photo:
+                        result = send_text(chat_id, SCREENSHOT_REQUEST_PROMPT)
+                        body = result.get("body", {}) if isinstance(result, dict) else {}
+                        save_message_to_db(
+                            "outgoing",
+                            chat_id,
+                            meta["bot"],
+                            meta["sender"],
+                            body.get("mid"),
+                            body.get("seq"),
+                            SCREENSHOT_REQUEST_PROMPT,
+                            raw_json=result,
+                        )
+                        update_chat_fields(chat_id=chat_id, finish=0, result=RESULT_IN_PROGRESS, tone_of_voice=tone_of_voice)
+                        continue
+
+                    if chat_info and chat_info.get("result") == "awaiting_retention_answer":
+                        result = send_text(chat_id, MANAGER_ESCALATION_TEXT)
+                        body = result.get("body", {}) if isinstance(result, dict) else {}
+                        save_message_to_db(
+                            "outgoing",
+                            chat_id,
+                            meta["bot"],
+                            meta["sender"],
+                            body.get("mid"),
+                            body.get("seq"),
+                            MANAGER_ESCALATION_TEXT,
+                            raw_json=result,
+                        )
+                        update_chat_fields(
+                            chat_id=chat_id,
+                            finish=1,
+                            result="manager_escalation_negative_followup",
+                            tone_of_voice=tone_of_voice or "negative",
+                        )
+                        continue
+
+                    if chat_info and chat_info.get("result") == "awaiting_dislike_reason":
+                        incoming_text = (meta["text"] or "").strip()
+                        if _is_reason_specific_enough(incoming_text):
+                            negative_followup_text = incoming_text
+                        else:
+                            analysis = summarize_negative_followup(
+                                query=incoming_text,
+                                history=history,
+                                short_history=short_history,
+                                model=os.getenv("CLASSIFIER_MODEL", "gpt-4.1-mini"),
+                            )
+                            if analysis.get("needs_clarification"):
+                                clarifying_question = (analysis.get("clarifying_question") or "").strip() or NEGATIVE_REASON_PROMPT
+                                result = send_text(chat_id, clarifying_question)
+                                body = result.get("body", {}) if isinstance(result, dict) else {}
+                                save_message_to_db(
+                                    "outgoing",
+                                    chat_id,
+                                    meta["bot"],
+                                    meta["sender"],
+                                    body.get("mid"),
+                                    body.get("seq"),
+                                    clarifying_question,
+                                    raw_json=result,
+                                )
+                                continue
+                            negative_followup_text = (analysis.get("negative_followup") or "").strip() or incoming_text
+
+                        result = send_text(chat_id, RETENTION_PROMPT)
+                        body = result.get("body", {}) if isinstance(result, dict) else {}
+                        save_message_to_db(
+                            "outgoing",
+                            chat_id,
+                            meta["bot"],
+                            meta["sender"],
+                            body.get("mid"),
+                            body.get("seq"),
+                            RETENTION_PROMPT,
+                            raw_json=result,
+                        )
+                        update_chat_fields(
+                            chat_id=chat_id,
+                            finish=0,
+                            result="awaiting_retention_answer",
+                            tone_of_voice=tone_of_voice or "negative",
+                            dislike_reason=negative_followup_text,
+                            negative_followup=negative_followup_text,
+                        )
+                        continue
+
                     text_count = count_text_messages_from_db(chat_id, direction="incoming")
                     if text_count > MAX_TEXT_MESSAGES:
                         send_text(chat_id, MANAGER_ESCALATION_TEXT)
@@ -655,13 +944,10 @@ def main() -> None:
                     continue
 
                 if meta["text"]:
-                    history = build_history_for_llm(chat_id, limit=20)
-                    short_history = build_short_history_context(chat_id, limit=8)
-                    tone_of_voice = detect_tone_of_voice(meta["text"], history, model=os.getenv("CLASSIFIER_MODEL", "gpt-4.1-mini"))
                     dialog_state = detect_dialog_state(meta["text"], history, get_photo=get_photo, model=os.getenv("CLASSIFIER_MODEL", "gpt-4.1-mini"))
 
                     if dialog_state == "negative_followup":
-                        result = send_text(chat_id, MANAGER_ESCALATION_TEXT)
+                        result = send_text(chat_id, NEGATIVE_REASON_PROMPT)
                         body = result.get("body", {}) if isinstance(result, dict) else {}
                         save_message_to_db(
                             "outgoing",
@@ -670,13 +956,13 @@ def main() -> None:
                             meta["sender"],
                             body.get("mid"),
                             body.get("seq"),
-                            MANAGER_ESCALATION_TEXT,
+                            NEGATIVE_REASON_PROMPT,
                             raw_json=result,
                         )
                         update_chat_fields(
                             chat_id,
-                            finish=1,
-                            result="manager_escalation_negative_followup",
+                            finish=0,
+                            result="awaiting_dislike_reason",
                             tone_of_voice=tone_of_voice,
                         )
                         continue
