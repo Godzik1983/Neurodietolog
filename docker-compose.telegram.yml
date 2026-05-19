@@ -1,0 +1,11 @@
+﻿services:
+  telegram_reviews_bot:
+    build:
+      context: ./telegram_reviews_bot
+      dockerfile: Dockerfile
+    container_name: telegram_reviews_bot
+    env_file:
+      - ./telegram_reviews_bot/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
