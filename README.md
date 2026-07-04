@@ -71,3 +71,27 @@ https://api.telegram.org/bot<TELEGRAM_TOKEN>/setWebhook?url=https://neurodietolo
 ```text
 https://api.telegram.org/bot<TELEGRAM_TOKEN>/getWebhookInfo
 ```
+
+## Dashboard по отзывам (Postgres)
+
+Показывает:
+- что именно не понравилось клиенту (`negative_followup`/`dislike_reason`)
+- когда был диалог (`last_seen_at`)
+- статус завершения (`finish`) и `result`
+- детали сообщений по выбранному чату
+- выгрузку отфильтрованного списка в CSV
+
+Запуск:
+
+```bash
+docker compose -f docker-compose.dashboard.yml up -d --build
+```
+
+Открыть:
+
+```text
+http://localhost:8501
+```
+
+Опционально для точного определения источника (MAX/Telegram) можно передать в сервис:
+`MAX_BOT_ID` и `TELEGRAM_BOT_ID`.

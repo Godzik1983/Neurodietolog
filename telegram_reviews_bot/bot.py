@@ -69,6 +69,19 @@ dp = Dispatcher()
 get_photo_by_chat: dict[int, bool] = {}
 
 
+def safe_model_dump(value) -> dict:
+    try:
+        return json.loads(value.model_dump_json(exclude_none=True))
+    except Exception:
+        try:
+            return value.model_dump(mode="json", exclude_none=True)
+        except Exception:
+            try:
+                return json.loads(json.dumps(value.model_dump(exclude_none=True), ensure_ascii=False, default=str))
+            except Exception:
+                return {"repr": repr(value)}
+
+
 def build_tg_meta(message: Message, bot_id: int) -> dict:
     return {
         "chat_id": message.chat.id,
@@ -103,7 +116,7 @@ async def send_and_log(
         message_id=str(sent.message_id),
         seq=None,
         text=text,
-        raw_json=sent.model_dump(),
+        raw_json=safe_model_dump(sent),
     )
 
 
@@ -111,6 +124,15 @@ async def send_initial_message_tg(bot: Bot, message: Message) -> None:
     bot_id = (await bot.get_me()).id
     chat_id = message.chat.id
     sender = message.from_user.id if message.from_user else 0
+    upsert_chat(
+        chat_id=chat_id,
+        chat_type=str(message.chat.type),
+        sender=sender,
+        bot=bot_id,
+        finish=0,
+        tone_of_voice=None,
+        result=RESULT_IN_PROGRESS,
+    )
     await send_and_log(bot, chat_id, INITIAL_MESSAGE, bot_id, sender, with_delay=False)
     update_chat_fields(chat_id=chat_id, finish=0, result=RESULT_IN_PROGRESS)
 
@@ -125,7 +147,7 @@ async def process_text_message(bot: Bot, message: Message) -> None:
         chat_type=meta["chat_type"],
         sender=meta["sender"],
         bot=meta["bot"],
-        finish=0,
+        finish=None,
         tone_of_voice=None,
         result=None,
     )
@@ -152,7 +174,7 @@ async def process_text_message(bot: Bot, message: Message) -> None:
         attachment_type=None,
         attachment_url=None,
         file_path=None,
-        raw_json=message.model_dump(),
+        raw_json=safe_model_dump(message),
     )
 
     history = build_history_for_llm(chat_id, limit=20)
@@ -187,8 +209,8 @@ async def process_text_message(bot: Bot, message: Message) -> None:
         return
 
     if meta["text"] and count_text_messages_from_db(chat_id, direction="incoming") > MAX_TEXT_MESSAGES:
-        await send_and_log(bot, chat_id, MANAGER_ESCALATION_TEXT, bot_id, meta["sender"] or 0)
-        update_chat_fields(chat_id=chat_id, finish=1, result="manager_escalation_text_limit")
+        await send_and_log(bot, chat_id, FINISHED_DIALOG_TEXT, bot_id, meta["sender"] or 0)
+        update_chat_fields(chat_id=chat_id, finish=1, result="max_text_messages_reached")
         return
 
     if chat_info and chat_info.get("result") == "awaiting_retention_answer":
@@ -274,7 +296,7 @@ async def process_photo_message(bot: Bot, message: Message) -> None:
     chat_id = message.chat.id
     sender_id = message.from_user.id if message.from_user else 0
 
-    upsert_chat(chat_id=chat_id, chat_type=str(message.chat.type), sender=sender_id, bot=bot_id, finish=0, tone_of_voice=None, result=None)
+    upsert_chat(chat_id=chat_id, chat_type=str(message.chat.type), sender=sender_id, bot=bot_id, finish=None, tone_of_voice=None, result=None)
 
     chat_info = get_chat(chat_id)
     if chat_info and chat_info.get("finish") == 1:
@@ -282,8 +304,8 @@ async def process_photo_message(bot: Bot, message: Message) -> None:
         return
 
     if count_attachments_from_db(chat_id, attachment_type="image") >= MAX_IMAGE_PROCESSED:
-        await send_and_log(bot, chat_id, MANAGER_ESCALATION_TEXT, bot_id, sender_id)
-        update_chat_fields(chat_id=chat_id, finish=1, result="manager_escalation_image_limit")
+        await send_and_log(bot, chat_id, FINISHED_DIALOG_TEXT, bot_id, sender_id)
+        update_chat_fields(chat_id=chat_id, finish=1, result="max_image_processed_reached")
         return
 
     if not message.photo:
@@ -312,7 +334,7 @@ async def process_photo_message(bot: Bot, message: Message) -> None:
             attachment_type="image",
             attachment_url=None,
             file_path=temp_path,
-            raw_json=message.model_dump(),
+            raw_json=safe_model_dump(message),
         )
 
         verification = analyze_review_screenshot(file_path=temp_path, model=SCREENSHOT_MODEL)

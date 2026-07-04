@@ -28,11 +28,18 @@ try:
 except Exception:  # pragma: no cover
     OpenAI = Any  # type: ignore
 
+try:
+    import psycopg2
+except Exception:  # pragma: no cover
+    psycopg2 = Any  # type: ignore
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 DB_PATH = os.getenv("DB_PATH", "/data/max_dialogs.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PLATFORM_NAME = "max"
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/data/downloads"))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -82,6 +89,37 @@ client: Any = None
 whisper_model: Any = None
 
 
+class _CursorProxy:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, query, params=None):
+        query = query.replace("?", "%s")
+        self._cursor.execute(query, params or ())
+        return self
+
+    def __getattr__(self, item):
+        return getattr(self._cursor, item)
+
+
+class _ConnectionProxy:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _CursorProxy(self._conn.cursor())
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, item):
+        return getattr(self._conn, item)
+
+
 def get_openai_client():
     global client
     if client is None:
@@ -93,60 +131,119 @@ def get_openai_client():
 
 
 
-def get_db() -> sqlite3.Connection:
+def get_db():
+    if DATABASE_URL:
+        if psycopg2 is Any:
+            raise RuntimeError("psycopg2-binary is required when DATABASE_URL is set")
+        return _ConnectionProxy(psycopg2.connect(DATABASE_URL))
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def _db_id(value):
+    if value is None:
+        return None
+    return str(value) if DATABASE_URL else value
+
+
 def init_db() -> None:
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS chats (
-            chat_id INTEGER PRIMARY KEY,
-            chat_type TEXT,
-            sender INTEGER,
-            bot INTEGER,
-            title TEXT,
-            finish INTEGER DEFAULT 0,
-            tone_of_voice TEXT,
-            dislike_reason TEXT,
-            negative_followup TEXT,
-            result TEXT,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL
+    if DATABASE_URL:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id TEXT PRIMARY KEY,
+                platform TEXT NOT NULL,
+                chat_type TEXT,
+                sender TEXT,
+                bot TEXT,
+                title TEXT,
+                finish INTEGER DEFAULT 0,
+                tone_of_voice TEXT,
+                result TEXT,
+                complaint_raw_text TEXT,
+                get_photo INTEGER DEFAULT 0,
+                send_disabled INTEGER DEFAULT 0,
+                send_disabled_reason TEXT,
+                last_followup_at TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            )
+            """
         )
-        """
-    )
-    cur.execute("PRAGMA table_info(chats)")
-    columns = {row[1] for row in cur.fetchall()}
-    if "dislike_reason" not in columns:
-        cur.execute("ALTER TABLE chats ADD COLUMN dislike_reason TEXT")
-    if "negative_followup" not in columns:
-        cur.execute("ALTER TABLE chats ADD COLUMN negative_followup TEXT")
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            direction TEXT NOT NULL,
-            chat_id INTEGER NOT NULL,
-            sender_user_id INTEGER,
-            recipient_user_id INTEGER,
-            message_id TEXT,
-            seq INTEGER,
-            text TEXT,
-            attachment_type TEXT,
-            attachment_url TEXT,
-            file_path TEXT,
-            raw_json TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+        cur.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS complaint_raw_text TEXT")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id BIGSERIAL PRIMARY KEY,
+                direction TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                sender_user_id TEXT,
+                recipient_user_id TEXT,
+                message_id TEXT,
+                seq BIGINT,
+                text TEXT,
+                attachment_type TEXT,
+                attachment_url TEXT,
+                file_path TEXT,
+                raw_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+            )
+            """
         )
-        """
-    )
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)")
+        cur.execute("ALTER TABLE messages ALTER COLUMN seq TYPE BIGINT")
+    else:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                chat_type TEXT,
+                sender INTEGER,
+                bot INTEGER,
+                title TEXT,
+                finish INTEGER DEFAULT 0,
+                tone_of_voice TEXT,
+                dislike_reason TEXT,
+                negative_followup TEXT,
+                result TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("PRAGMA table_info(chats)")
+        columns = {row[1] for row in cur.fetchall()}
+        if "dislike_reason" not in columns:
+            cur.execute("ALTER TABLE chats ADD COLUMN dislike_reason TEXT")
+        if "negative_followup" not in columns:
+            cur.execute("ALTER TABLE chats ADD COLUMN negative_followup TEXT")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                direction TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                sender_user_id INTEGER,
+                recipient_user_id INTEGER,
+                message_id TEXT,
+                seq INTEGER,
+                text TEXT,
+                attachment_type TEXT,
+                attachment_url TEXT,
+                file_path TEXT,
+                raw_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id)")
     conn.commit()
     conn.close()
 
@@ -155,21 +252,39 @@ def upsert_chat(chat_id: int, chat_type=None, sender=None, bot=None, finish=0, t
     now = datetime.now().isoformat(timespec="seconds")
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO chats (chat_id, chat_type, sender, bot, finish, tone_of_voice, result, first_seen_at, last_seen_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET
-            chat_type = COALESCE(excluded.chat_type, chats.chat_type),
-            sender = COALESCE(excluded.sender, chats.sender),
-            bot = COALESCE(excluded.bot, chats.bot),
-            finish = COALESCE(excluded.finish, chats.finish),
-            tone_of_voice = COALESCE(excluded.tone_of_voice, chats.tone_of_voice),
-            result = COALESCE(excluded.result, chats.result),
-            last_seen_at = excluded.last_seen_at
-        """,
-        (chat_id, chat_type, sender, bot, finish, tone_of_voice, result, now, now),
-    )
+    if DATABASE_URL:
+        cur.execute(
+            """
+            INSERT INTO chats (chat_id, platform, chat_type, sender, bot, finish, tone_of_voice, result, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                platform = COALESCE(excluded.platform, chats.platform),
+                chat_type = COALESCE(excluded.chat_type, chats.chat_type),
+                sender = COALESCE(excluded.sender, chats.sender),
+                bot = COALESCE(excluded.bot, chats.bot),
+                finish = COALESCE(excluded.finish, chats.finish),
+                tone_of_voice = COALESCE(excluded.tone_of_voice, chats.tone_of_voice),
+                result = COALESCE(excluded.result, chats.result),
+                last_seen_at = excluded.last_seen_at
+            """,
+            (_db_id(chat_id), PLATFORM_NAME, chat_type, _db_id(sender), _db_id(bot), finish, tone_of_voice, result, now, now),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO chats (chat_id, chat_type, sender, bot, finish, tone_of_voice, result, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                chat_type = COALESCE(excluded.chat_type, chats.chat_type),
+                sender = COALESCE(excluded.sender, chats.sender),
+                bot = COALESCE(excluded.bot, chats.bot),
+                finish = COALESCE(excluded.finish, chats.finish),
+                tone_of_voice = COALESCE(excluded.tone_of_voice, chats.tone_of_voice),
+                result = COALESCE(excluded.result, chats.result),
+                last_seen_at = excluded.last_seen_at
+            """,
+            (chat_id, chat_type, sender, bot, finish, tone_of_voice, result, now, now),
+        )
     conn.commit()
     conn.close()
 
@@ -177,26 +292,49 @@ def upsert_chat(chat_id: int, chat_type=None, sender=None, bot=None, finish=0, t
 def save_message_to_db(direction: str, chat_id: int, sender_user_id=None, recipient_user_id=None, message_id=None, seq=None, text=None, attachment_type=None, attachment_url=None, file_path=None, raw_json=None) -> None:
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO messages (direction, chat_id, sender_user_id, recipient_user_id, message_id, seq, text, attachment_type, attachment_url, file_path, raw_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            direction,
-            chat_id,
-            sender_user_id,
-            recipient_user_id,
-            message_id,
-            seq,
-            text,
-            attachment_type,
-            attachment_url,
-            file_path,
-            json.dumps(raw_json, ensure_ascii=False) if raw_json is not None else None,
-            datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
+    if DATABASE_URL:
+        cur.execute(
+            """
+            INSERT INTO messages (direction, platform, chat_id, sender_user_id, recipient_user_id, message_id, seq, text, attachment_type, attachment_url, file_path, raw_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                direction,
+                PLATFORM_NAME,
+                _db_id(chat_id),
+                _db_id(sender_user_id),
+                _db_id(recipient_user_id),
+                message_id,
+                seq,
+                text,
+                attachment_type,
+                attachment_url,
+                file_path,
+                json.dumps(raw_json, ensure_ascii=False) if raw_json is not None else None,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO messages (direction, chat_id, sender_user_id, recipient_user_id, message_id, seq, text, attachment_type, attachment_url, file_path, raw_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                direction,
+                chat_id,
+                sender_user_id,
+                recipient_user_id,
+                message_id,
+                seq,
+                text,
+                attachment_type,
+                attachment_url,
+                file_path,
+                json.dumps(raw_json, ensure_ascii=False) if raw_json is not None else None,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
     conn.commit()
     conn.close()
 
@@ -213,15 +351,21 @@ def update_chat_fields(chat_id: int, finish=None, tone_of_voice=None, result=Non
     if result is not None:
         updates.append("result = ?")
         params.append(result)
-    if dislike_reason is not None:
+    if dislike_reason is not None and not DATABASE_URL:
         updates.append("dislike_reason = ?")
         params.append(dislike_reason)
-    if negative_followup is not None:
+    if negative_followup is not None and not DATABASE_URL:
         updates.append("negative_followup = ?")
         params.append(negative_followup)
+    if DATABASE_URL and (dislike_reason is not None or negative_followup is not None):
+        complaint_text = (negative_followup or dislike_reason or "").strip() or None
+        updates.append("complaint_raw_text = ?")
+        params.append(complaint_text)
+        updates.append("last_followup_at = ?")
+        params.append(datetime.now().isoformat(timespec="seconds"))
     updates.append("last_seen_at = ?")
     params.append(datetime.now().isoformat(timespec="seconds"))
-    params.append(chat_id)
+    params.append(_db_id(chat_id) if DATABASE_URL else chat_id)
 
     conn = get_db()
     cur = conn.cursor()
@@ -233,11 +377,23 @@ def update_chat_fields(chat_id: int, finish=None, tone_of_voice=None, result=Non
 def get_chat(chat_id: int):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT chat_id, finish, result, tone_of_voice, dislike_reason, negative_followup FROM chats WHERE chat_id = ?", (chat_id,))
+    if DATABASE_URL:
+        cur.execute("SELECT chat_id, finish, result, tone_of_voice, complaint_raw_text FROM chats WHERE chat_id = ?", (_db_id(chat_id),))
+    else:
+        cur.execute("SELECT chat_id, finish, result, tone_of_voice, dislike_reason, negative_followup FROM chats WHERE chat_id = ?", (chat_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
         return None
+    if DATABASE_URL:
+        return {
+            "chat_id": row[0],
+            "finish": row[1],
+            "result": row[2],
+            "tone_of_voice": row[3],
+            "dislike_reason": row[4],
+            "negative_followup": row[4],
+        }
     return {
         "chat_id": row[0],
         "finish": row[1],
@@ -286,10 +442,11 @@ def _extract_rating(text: str) -> int | None:
 def count_messages_from_db(chat_id: int, direction=None) -> int:
     conn = get_db()
     cur = conn.cursor()
+    chat_id_value = _db_id(chat_id)
     if direction:
-        cur.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ? AND direction = ?", (chat_id, direction))
+        cur.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ? AND direction = ?", (chat_id_value, direction))
     else:
-        cur.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id,))
+        cur.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ?", (chat_id_value,))
     c = cur.fetchone()[0]
     conn.close()
     return c
@@ -298,7 +455,7 @@ def count_messages_from_db(chat_id: int, direction=None) -> int:
 def count_attachments_from_db(chat_id: int, attachment_type="image") -> int:
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ? AND attachment_type = ?", (chat_id, attachment_type))
+    cur.execute("SELECT COUNT(*) FROM messages WHERE chat_id = ? AND attachment_type = ?", (_db_id(chat_id), attachment_type))
     c = cur.fetchone()[0]
     conn.close()
     return c
@@ -309,11 +466,49 @@ def count_text_messages_from_db(chat_id: int, direction: str = "incoming") -> in
     cur = conn.cursor()
     cur.execute(
         "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND direction = ? AND text IS NOT NULL AND TRIM(text) != ''",
-        (chat_id, direction),
+        (_db_id(chat_id), direction),
     )
     c = cur.fetchone()[0]
     conn.close()
     return c
+
+
+def reset_chat_session(chat_id: int) -> None:
+    conn = get_db()
+    cur = conn.cursor()
+    now = datetime.now().isoformat(timespec="seconds")
+    chat_id_value = _db_id(chat_id)
+    cur.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id_value,))
+    if DATABASE_URL:
+        cur.execute(
+            """
+            UPDATE chats
+            SET finish = 0,
+                tone_of_voice = NULL,
+                result = ?,
+                complaint_raw_text = NULL,
+                last_followup_at = NULL,
+                last_seen_at = ?
+            WHERE chat_id = ?
+            """,
+            (RESULT_IN_PROGRESS, now, chat_id_value),
+        )
+    else:
+        cur.execute(
+            """
+            UPDATE chats
+            SET finish = 0,
+                tone_of_voice = NULL,
+                dislike_reason = NULL,
+                negative_followup = NULL,
+                result = ?,
+                last_seen_at = ?
+            WHERE chat_id = ?
+            """,
+            (RESULT_IN_PROGRESS, now, chat_id),
+        )
+    conn.commit()
+    conn.close()
 
 
 def extract_message_meta(update: dict):
@@ -354,7 +549,7 @@ def build_short_history_context(chat_id: int, limit: int = 8, max_chars: int = 1
     cur = conn.cursor()
     cur.execute(
         "SELECT direction, text FROM messages WHERE chat_id = ? AND text IS NOT NULL AND TRIM(text) != '' ORDER BY id DESC LIMIT ?",
-        (chat_id, limit),
+        (_db_id(chat_id), limit),
     )
     rows = list(reversed(cur.fetchall()))
     conn.close()
@@ -365,7 +560,7 @@ def build_short_history_context(chat_id: int, limit: int = 8, max_chars: int = 1
 def build_history_for_llm(chat_id: int, limit: int = 20) -> str:
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT direction, text, created_at FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?", (chat_id, limit))
+    cur.execute("SELECT direction, text, created_at FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?", (_db_id(chat_id), limit))
     rows = list(reversed(cur.fetchall()))
     conn.close()
     lines = []
@@ -736,6 +931,11 @@ def main() -> None:
                 chat_id = meta["chat_id"]
                 upsert_chat(chat_id, meta["chat_type"], meta["sender"], meta["bot"], finish=None, tone_of_voice=None, result=None)
 
+                if is_start_message(meta):
+                    reset_chat_session(chat_id)
+                    send_initial_message(chat_id, meta["bot"], meta["sender"])
+                    continue
+
                 chat_info = get_chat(chat_id)
                 if chat_info and chat_info.get("finish") == 1:
                     if meta["text"]:
@@ -936,9 +1136,6 @@ def main() -> None:
                         save_message_to_db("outgoing", chat_id, meta["bot"], meta["sender"], body.get("mid"), body.get("seq"), bot_text, raw_json=result)
                     continue
 
-                if is_start_message(meta):
-                    send_initial_message(chat_id, meta["bot"], meta["sender"])
-                    continue
                 if not has_outgoing_messages(chat_id):
                     send_initial_message(chat_id, meta["bot"], meta["sender"])
                     continue

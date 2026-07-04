@@ -1,0 +1,11 @@
+services:
+  reviews_dashboard:
+    build:
+      context: ./reviews_dashboard
+      dockerfile: Dockerfile
+    container_name: reviews_dashboard
+    environment:
+      - DATABASE_URL=postgresql://botuser:botpass123@host.docker.internal:5432/botdb
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
