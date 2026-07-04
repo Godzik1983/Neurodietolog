@@ -1,8 +1,8 @@
-services:
+﻿services:
   telegram_reviews_bot:
     build:
-      context: .
-      dockerfile: ./telegram_reviews_bot/Dockerfile
+      context: ./telegram_reviews_bot
+      dockerfile: Dockerfile
     container_name: telegram_reviews_bot
     env_file:
       - ./telegram_reviews_bot/.env

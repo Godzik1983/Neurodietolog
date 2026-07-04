@@ -1,8 +1,9 @@
+﻿
 services:
   max_reviews_bot:
     build:
-      context: .
-      dockerfile: ./max_reviews_bot/Dockerfile
+      context: ./max_reviews_bot
+      dockerfile: Dockerfile
     container_name: max_reviews_bot
     env_file:
       - ./max_reviews_bot/.env
