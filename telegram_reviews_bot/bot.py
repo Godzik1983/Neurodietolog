@@ -1,4 +1,5 @@
 ﻿import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -152,17 +153,6 @@ async def process_text_message(bot: Bot, message: Message) -> None:
         result=None,
     )
 
-    chat_info = get_chat(chat_id)
-    if chat_info and chat_info.get("finish") == 1:
-        if meta["text"]:
-            await send_and_log(bot, chat_id, FINISHED_DIALOG_TEXT, bot_id, meta["sender"] or 0)
-        return
-
-    if count_messages_from_db(chat_id, direction="incoming") >= MAX_MESSAGES:
-        await send_and_log(bot, chat_id, FINISHED_DIALOG_TEXT, bot_id, meta["sender"] or 0)
-        update_chat_fields(chat_id=chat_id, finish=1, result="max_messages_reached")
-        return
-
     save_message_to_db(
         direction="incoming",
         chat_id=chat_id,
@@ -176,6 +166,19 @@ async def process_text_message(bot: Bot, message: Message) -> None:
         file_path=None,
         raw_json=safe_model_dump(message),
     )
+
+    chat_info = get_chat(chat_id)
+    if chat_info and chat_info.get("send_disabled") == 1:
+        return
+    if chat_info and chat_info.get("finish") == 1:
+        if meta["text"]:
+            await send_and_log(bot, chat_id, FINISHED_DIALOG_TEXT, bot_id, meta["sender"] or 0)
+        return
+
+    if count_messages_from_db(chat_id, direction="incoming") >= MAX_MESSAGES:
+        await send_and_log(bot, chat_id, FINISHED_DIALOG_TEXT, bot_id, meta["sender"] or 0)
+        update_chat_fields(chat_id=chat_id, finish=1, result="max_messages_reached")
+        return
 
     history = build_history_for_llm(chat_id, limit=20)
     short_history = build_short_history_context(chat_id, limit=8)
@@ -298,16 +301,6 @@ async def process_photo_message(bot: Bot, message: Message) -> None:
 
     upsert_chat(chat_id=chat_id, chat_type=str(message.chat.type), sender=sender_id, bot=bot_id, finish=None, tone_of_voice=None, result=None)
 
-    chat_info = get_chat(chat_id)
-    if chat_info and chat_info.get("finish") == 1:
-        await send_and_log(bot, chat_id, FINISHED_DIALOG_TEXT, bot_id, sender_id)
-        return
-
-    if count_attachments_from_db(chat_id, attachment_type="image") >= MAX_IMAGE_PROCESSED:
-        await send_and_log(bot, chat_id, FINISHED_DIALOG_TEXT, bot_id, sender_id)
-        update_chat_fields(chat_id=chat_id, finish=1, result="max_image_processed_reached")
-        return
-
     if not message.photo:
         await send_and_log(bot, chat_id, "No photo found in message", bot_id, sender_id)
         return
@@ -336,6 +329,18 @@ async def process_photo_message(bot: Bot, message: Message) -> None:
             file_path=temp_path,
             raw_json=safe_model_dump(message),
         )
+
+        chat_info = get_chat(chat_id)
+        if chat_info and chat_info.get("send_disabled") == 1:
+            return
+        if chat_info and chat_info.get("finish") == 1:
+            await send_and_log(bot, chat_id, FINISHED_DIALOG_TEXT, bot_id, sender_id)
+            return
+
+        if count_attachments_from_db(chat_id, attachment_type="image") >= MAX_IMAGE_PROCESSED:
+            await send_and_log(bot, chat_id, FINISHED_DIALOG_TEXT, bot_id, sender_id)
+            update_chat_fields(chat_id=chat_id, finish=1, result="max_image_processed_reached")
+            return
 
         verification = analyze_review_screenshot(file_path=temp_path, model=SCREENSHOT_MODEL)
         get_photo = verification.get("is_review_screenshot") is True

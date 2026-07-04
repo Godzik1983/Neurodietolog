@@ -339,7 +339,7 @@ def save_message_to_db(direction: str, chat_id: int, sender_user_id=None, recipi
     conn.close()
 
 
-def update_chat_fields(chat_id: int, finish=None, tone_of_voice=None, result=None, dislike_reason=None, negative_followup=None) -> None:
+def update_chat_fields(chat_id: int, finish=None, tone_of_voice=None, result=None, dislike_reason=None, negative_followup=None, send_disabled=None, send_disabled_reason=None) -> None:
     updates = []
     params = []
     if finish is not None:
@@ -351,6 +351,12 @@ def update_chat_fields(chat_id: int, finish=None, tone_of_voice=None, result=Non
     if result is not None:
         updates.append("result = ?")
         params.append(result)
+    if send_disabled is not None:
+        updates.append("send_disabled = ?")
+        params.append(send_disabled)
+    if send_disabled_reason is not None:
+        updates.append("send_disabled_reason = ?")
+        params.append(send_disabled_reason)
     if dislike_reason is not None and not DATABASE_URL:
         updates.append("dislike_reason = ?")
         params.append(dislike_reason)
@@ -378,9 +384,9 @@ def get_chat(chat_id: int):
     conn = get_db()
     cur = conn.cursor()
     if DATABASE_URL:
-        cur.execute("SELECT chat_id, finish, result, tone_of_voice, complaint_raw_text FROM chats WHERE chat_id = ?", (_db_id(chat_id),))
+        cur.execute("SELECT chat_id, finish, result, tone_of_voice, complaint_raw_text, send_disabled, send_disabled_reason FROM chats WHERE chat_id = ?", (_db_id(chat_id),))
     else:
-        cur.execute("SELECT chat_id, finish, result, tone_of_voice, dislike_reason, negative_followup FROM chats WHERE chat_id = ?", (chat_id,))
+        cur.execute("SELECT chat_id, finish, result, tone_of_voice, dislike_reason, negative_followup, 0, NULL FROM chats WHERE chat_id = ?", (chat_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
@@ -393,6 +399,8 @@ def get_chat(chat_id: int):
             "tone_of_voice": row[3],
             "dislike_reason": row[4],
             "negative_followup": row[4],
+            "send_disabled": row[5],
+            "send_disabled_reason": row[6],
         }
     return {
         "chat_id": row[0],
@@ -401,6 +409,8 @@ def get_chat(chat_id: int):
         "tone_of_voice": row[3],
         "dislike_reason": row[4],
         "negative_followup": row[5],
+        "send_disabled": row[6],
+        "send_disabled_reason": row[7],
     }
 
 
@@ -487,6 +497,8 @@ def reset_chat_session(chat_id: int) -> None:
                 tone_of_voice = NULL,
                 result = ?,
                 complaint_raw_text = NULL,
+                send_disabled = 0,
+                send_disabled_reason = NULL,
                 last_followup_at = NULL,
                 last_seen_at = ?
             WHERE chat_id = ?
@@ -501,6 +513,8 @@ def reset_chat_session(chat_id: int) -> None:
                 tone_of_voice = NULL,
                 dislike_reason = NULL,
                 negative_followup = NULL,
+                send_disabled = 0,
+                send_disabled_reason = NULL,
                 result = ?,
                 last_seen_at = ?
             WHERE chat_id = ?
@@ -936,17 +950,6 @@ def main() -> None:
                     send_initial_message(chat_id, meta["bot"], meta["sender"])
                     continue
 
-                chat_info = get_chat(chat_id)
-                if chat_info and chat_info.get("finish") == 1:
-                    if meta["text"]:
-                        send_text(chat_id, FINISHED_DIALOG_TEXT)
-                    continue
-
-                if count_messages_from_db(chat_id, direction="incoming") >= MAX_MESSAGES:
-                    send_text(chat_id, FINISHED_DIALOG_TEXT)
-                    update_chat_fields(chat_id=chat_id, finish=1, result="max_messages_reached")
-                    continue
-
                 attachment_type = None
                 attachment_url = None
                 file_path = None
@@ -975,6 +978,19 @@ def main() -> None:
                     file_path,
                     upd,
                 )
+
+                chat_info = get_chat(chat_id)
+                if chat_info and chat_info.get("send_disabled") == 1:
+                    continue
+                if chat_info and chat_info.get("finish") == 1:
+                    if meta["text"]:
+                        send_text(chat_id, FINISHED_DIALOG_TEXT)
+                    continue
+
+                if count_messages_from_db(chat_id, direction="incoming") >= MAX_MESSAGES:
+                    send_text(chat_id, FINISHED_DIALOG_TEXT)
+                    update_chat_fields(chat_id=chat_id, finish=1, result="max_messages_reached")
+                    continue
 
                 if not meta["text"] and attachment_type not in {"image", "audio", "voice"}:
                     send_text(chat_id, TEXT_ONLY_PROMPT)

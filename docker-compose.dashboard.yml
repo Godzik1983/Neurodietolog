@@ -1,11 +1,16 @@
-services:
+﻿services:
   reviews_dashboard:
     build:
       context: ./reviews_dashboard
       dockerfile: Dockerfile
     container_name: reviews_dashboard
     environment:
-      - DATABASE_URL=postgresql://botuser:botpass123@host.docker.internal:5432/botdb
+      - DATABASE_URL=${DATABASE_URL:-postgresql://botuser:botpass123@host.docker.internal:5432/botdb}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - MAX_BOT_TOKEN=${MAX_BOT_TOKEN}
+      - MAX_BASE_URL=${MAX_BASE_URL:-https://platform-api.max.ru}
+      - MAX_BOT_ID=${MAX_BOT_ID:-}
+      - TELEGRAM_BOT_ID=${TELEGRAM_BOT_ID:-}
     ports:
       - "8501:8501"
     restart: unless-stopped
